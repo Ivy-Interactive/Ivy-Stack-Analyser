@@ -1,11 +1,12 @@
 <#
 .SYNOPSIS
-    Drives the /review-stack-analyse skill over the URLs in repos.txt.
+    Drives the /review-stack-analyse skill over the URLs in queue.txt.
 
 .DESCRIPTION
-    Pops the first URL from repos.txt (removing it from the file) and launches
-    Claude Code headlessly with the prompt "/review-stack-analyse <url>". Repeats
-    until -Count reviews have been started, running up to -Parallel at a time.
+    Pops the first URL from queue.txt (removing it) and launches Claude Code
+    headlessly with the prompt "/review-stack-analyse <url>". Repeats until -Count
+    reviews have been started, running up to -Parallel at a time. Each tested repo
+    is appended to done.txt when its review finishes.
 
     Each review runs in the repository root (so the project-scoped skill resolves)
     and its output is captured under src/.review-logs/. Any disagreements the skill
@@ -17,8 +18,11 @@
 .PARAMETER Count
     How many reviews to run in total. Default: 1.
 
-.PARAMETER ReposFile
-    Path to the URL list. Default: repos.txt next to this script.
+.PARAMETER QueueFile
+    Path to the pending URL list. Default: queue.txt next to this script.
+
+.PARAMETER DoneFile
+    Path to the completed-URL log. Default: done.txt next to this script.
 
 .PARAMETER RequirePermissions
     By default reviews run with --dangerously-skip-permissions so the unattended
@@ -32,7 +36,8 @@
 param(
     [int]$Parallel = 1,
     [int]$Count = 1,
-    [string]$ReposFile = (Join-Path $PSScriptRoot 'repos.txt'),
+    [string]$QueueFile = (Join-Path $PSScriptRoot 'queue.txt'),
+    [string]$DoneFile = (Join-Path $PSScriptRoot 'done.txt'),
     [switch]$RequirePermissions
 )
 
@@ -40,18 +45,19 @@ $ErrorActionPreference = 'Stop'
 
 if ($Parallel -lt 1) { throw '-Parallel must be >= 1.' }
 if ($Count -lt 1) { throw '-Count must be >= 1.' }
-if (-not (Test-Path -LiteralPath $ReposFile)) { throw "Repos file not found: $ReposFile" }
+if (-not (Test-Path -LiteralPath $QueueFile)) { throw "Queue file not found: $QueueFile" }
 if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
     throw "The 'claude' CLI was not found on PATH. Install Claude Code first."
 }
+if (-not (Test-Path -LiteralPath $DoneFile)) { New-Item -ItemType File -Path $DoneFile | Out-Null }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot          # skill is scoped to the repo root
 $logDir = Join-Path $PSScriptRoot '.review-logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
-# Pops the first non-empty URL from the file and rewrites it without that line.
+# Pops the first non-empty URL from the queue and rewrites it without that line.
 function Pop-NextUrl {
-    $lines = @(Get-Content -LiteralPath $ReposFile)
+    $lines = @(Get-Content -LiteralPath $QueueFile)
     $idx = -1
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i].Trim().Length -gt 0) { $idx = $i; break }
@@ -59,7 +65,7 @@ function Pop-NextUrl {
     if ($idx -lt 0) { return $null }
     $url = $lines[$idx].Trim()
     $remaining = for ($i = 0; $i -lt $lines.Count; $i++) { if ($i -ne $idx) { $lines[$i] } }
-    Set-Content -LiteralPath $ReposFile -Value $remaining
+    Set-Content -LiteralPath $QueueFile -Value $remaining
     return $url
 }
 
@@ -72,14 +78,14 @@ $running = [System.Collections.ArrayList]::new()
 $dispatched = 0
 $completed = 0
 
-Write-Host "Running $Count review(s), $Parallel at a time, from $ReposFile" -ForegroundColor Cyan
+Write-Host "Running $Count review(s), $Parallel at a time, from $QueueFile" -ForegroundColor Cyan
 
 while ($dispatched -lt $Count -or $running.Count -gt 0) {
     # Launch while we have spare capacity and budget remaining.
     while ($running.Count -lt $Parallel -and $dispatched -lt $Count) {
         $url = Pop-NextUrl
         if (-not $url) {
-            Write-Warning "repos.txt is empty after $dispatched dispatched; stopping new launches."
+            Write-Warning "queue.txt is empty after $dispatched dispatched; stopping new launches."
             $Count = $dispatched
             break
         }
@@ -104,9 +110,11 @@ while ($dispatched -lt $Count -or $running.Count -gt 0) {
     foreach ($f in $finished) {
         $completed++
         $status = if ($f.Proc.ExitCode -eq 0) { 'ok' } else { "exit $($f.Proc.ExitCode)" }
+        # Record the tested repo (append; main loop is the only writer, so this is safe).
+        Add-Content -LiteralPath $DoneFile -Value $f.Url
         Write-Host ("  done [{0}]: {1} ({2}) -> {3}" -f $status, $f.Url, $completed, $f.Log)
         [void]$running.Remove($f)
     }
 }
 
-Write-Host "Finished: $completed review(s) completed." -ForegroundColor Cyan
+Write-Host "Finished: $completed review(s) completed; recorded in $DoneFile." -ForegroundColor Cyan
